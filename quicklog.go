@@ -3,13 +3,14 @@
 package quicklog
 
 import (
-	"github.com/epmoyer/callsite"
 	"fmt"
+	"github.com/epmoyer/callsite"
 	"io"
 	"os"
 	"path"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 
 	"gopkg.in/natefinch/lumberjack.v2"
@@ -19,7 +20,7 @@ type LogLevel int8
 
 const defaultMaxBackups = 5
 const defaultMaxSize = 50 // 50 MB
-const packageVersion = "v2.0.0"
+const packageVersion = "v2.1.0"
 
 const (
 	LogLevelTrace LogLevel = iota
@@ -28,7 +29,10 @@ const (
 	LogLevelError
 )
 
-var loggers = make(map[string]*LoggerT)
+var (
+	loggers   = make(map[string]*LoggerT)
+	loggersMu sync.Mutex
+)
 
 func (level LogLevel) String() string {
 	switch level {
@@ -56,7 +60,9 @@ type ConfigT struct {
 	MaxSize int
 	// MaxBackups the max number of rolled files to keep
 	MaxBackups int
-	// MaxAge the max age in days to keep a log file
+	// MaxAge the max age in days to keep a rolled log file. Unlike MaxSize and
+	// MaxBackups, this has no default: if left 0, lumberjack performs no
+	// age-based deletion (the file count is still bounded by MaxBackups).
 	MaxAge int
 	// Min LogLevel to log
 	Level LogLevel
@@ -74,6 +80,9 @@ func (c *ConfigT) SetDefaults() {
 	if c.MaxSize == 0 {
 		c.MaxSize = defaultMaxSize
 	}
+	// NOTE: MaxAge is intentionally not defaulted. Leaving it 0 disables
+	// age-based deletion in lumberjack; the number of rolled files is still
+	// bounded by MaxBackups.
 }
 
 type LoggerT struct {
@@ -93,6 +102,14 @@ func GetLogger(loggerId string) *LoggerT {
 		panic("LoggerId must be set")
 	}
 
+	loggersMu.Lock()
+	defer loggersMu.Unlock()
+	return getLoggerLocked(loggerId)
+}
+
+// getLoggerLocked returns the logger registered for loggerId, lazily creating a
+// stderr stub if none exists yet. Callers MUST hold loggersMu.
+func getLoggerLocked(loggerId string) *LoggerT {
 	if logger, exists := loggers[loggerId]; exists {
 		return logger
 	}
@@ -116,11 +133,17 @@ func ConfigureLogger(config ConfigT) *LoggerT {
 	config.SetDefaults()
 	rollingFile := newRollingFile(config)
 
-	// This will return the stub logger if it exists, or create a new stub logger.
-	// If it return a REAL logger, then that means a logger has ALREADY been configured
-	// with the same LoggerId, which is not allowed, so we panic.
-	logger := GetLogger(config.LoggerId)
+	// Fetch-and-upgrade must happen atomically under the lock; otherwise two
+	// goroutines configuring the same LoggerId could both observe the stub and
+	// both "upgrade" it, racing on the fields and defeating the double-configure
+	// guard below.
+	loggersMu.Lock()
+	// getLoggerLocked returns the stub logger if it exists, or creates a new stub
+	// logger. If it returns a REAL logger, then a logger has ALREADY been
+	// configured with the same LoggerId, which is not allowed, so we panic.
+	logger := getLoggerLocked(config.LoggerId)
 	if !logger.IsStub {
+		loggersMu.Unlock()
 		panic(fmt.Sprintf("Logger with LoggerId '%s' has already been configured", config.LoggerId))
 	}
 
@@ -130,6 +153,7 @@ func ConfigureLogger(config ConfigT) *LoggerT {
 	logger.FnCallbackOnError = config.FnCallbackOnError
 	logger.IsDisabled = config.IsDisabled
 	logger.IsStub = false
+	loggersMu.Unlock()
 
 	logger.Info("---------------------------- BEGIN ----------------------------")
 	logger.Infof("quicklog %s", packageVersion)
@@ -214,9 +238,9 @@ func (l LoggerT) CreateLogEntry(msg string, level LogLevel) {
 }
 
 func newRollingFile(config ConfigT) io.Writer {
-	if err := os.MkdirAll(config.Directory, 0744); err != nil {
-		fmt.Printf("Can't create log directory at: %s\n", config.Directory)
-		return nil
+	if err := os.MkdirAll(config.Directory, 0755); err != nil {
+		fmt.Printf("quicklog: can't create log directory at %q (%v); falling back to stderr\n", config.Directory, err)
+		return os.Stderr
 	}
 
 	return &lumberjack.Logger{
@@ -227,25 +251,21 @@ func newRollingFile(config ConfigT) io.Writer {
 	}
 }
 
-// getFunctionNameOfCaller gets the name of the function which CALLED the function
-// which called getFunctionNameOfCaller.
-// func getFunctionNameOfCaller() string {
-// 	pc, _, _, ok := runtime.Caller(2) // 1 to get the calling function
-// 	if !ok {
-// 		return "unknown"
-// 	}
-// 	return runtime.FuncForPC(pc).Name()
-// }
-
 func getIndentedFunctionNameOfCaller() string {
 
 	// Start with skip = 2 to get the CALLER of the function that CALLS this function.
 	const depthOfCaller = 2
 
+	// maxTraceDepth caps how far up the stack we walk (and therefore how deep we
+	// indent). Goroutines that were not spawned from runtime.main never have
+	// runtime.main (or gin's Context.Next) on their stack, so without this cap the
+	// loop would walk all the way to the top of the goroutine's stack and produce
+	// nonsensically deep indentation.
+	const maxTraceDepth = 30
+
 	skip := depthOfCaller
-	// fmt.Printf("🟣  trace\n")
 	prefix := ""
-	for {
+	for skip-depthOfCaller < maxTraceDepth {
 		pc, _, _, ok := runtime.Caller(skip)
 		if !ok {
 			break

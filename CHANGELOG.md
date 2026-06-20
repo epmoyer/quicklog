@@ -8,6 +8,16 @@ to [Semantic Versioning](http://semver.org/spec/v2.0.0.html).
 
 ## Unreleased
 
+## v2.1.0 2026-06-20
+### Fixed
+- Avoid a panic on the first write when the log directory cannot be created. `newRollingFile` now falls back to `stderr` instead of returning a nil writer.
+- Guard the named-logger registry with a mutex, fixing a data race (and a racy double-configure check) when loggers are created or fetched concurrently.
+- Cap stack walking in `Trace()` so calls from goroutines not descended from `runtime.main` no longer produce runaway indentation.
+- Create the log directory with mode `0755` instead of `0744` so it is traversable.
+
+### Changed
+- Document that `ConfigT.MaxAge` has no default (0 disables age-based deletion; the rolled-file count is still bounded by `MaxBackups`), in both the code and the README.
+
 ## 2.0.0  2025-05-08
 ### Changed
 - Adopt named logger registry pattern.

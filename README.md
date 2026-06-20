@@ -76,10 +76,15 @@ to the real log file automatically.
 | `Filename`          | Log file name, placed inside `Directory`.                              | —       |
 | `MaxSize`           | Max size in MB before a file is rolled.                                | `50`    |
 | `MaxBackups`        | Max number of rolled files to keep.                                    | `5`     |
-| `MaxAge`            | Max age in days to keep a rolled file (0 = no limit).                  | `0`     |
+| `MaxAge`            | Max age in days to keep a rolled file (0 = no age-based deletion).      | `0`     |
 | `Level`             | Minimum `LogLevel` to log.                                             | `Trace` |
 | `FnCallbackOnError` | Called whenever an error is logged (e.g. to increment an error count). | `nil`   |
 | `IsDisabled`        | When true, suppress file logging; `*Print` helpers still print.        | `false` |
+
+> **Note on `MaxAge`:** unlike `MaxSize` and `MaxBackups`, `MaxAge` has no
+> default. If you leave it `0`, lumberjack performs no age-based deletion — old
+> rolled files are pruned only by the `MaxBackups` count, not by age. Set
+> `MaxAge` explicitly if you need time-based retention.
 
 ## License
 
