@@ -11,6 +11,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"gopkg.in/natefinch/lumberjack.v2"
@@ -95,6 +96,12 @@ type LoggerT struct {
 	// upgraded to a real logger when ConfigureLogger is called with the same LoggerId to
 	// create a real logger.
 	IsStub bool
+	// IsLogWriteFailedOnce records whether a write to RollingFile has already
+	// failed. We surface the first failure on stderr but stay quiet on every
+	// subsequent one so a broken sink doesn't spam. atomic.Bool keeps it safe
+	// under concurrent writes; methods use pointer receivers so it is never
+	// copied.
+	IsLogWriteFailedOnce atomic.Bool
 }
 
 func GetLogger(loggerId string) *LoggerT {
@@ -160,68 +167,68 @@ func ConfigureLogger(config ConfigT) *LoggerT {
 	return logger
 }
 
-func (l LoggerT) Trace() {
+func (l *LoggerT) Trace() {
 	// msg := getFunctionNameOfCaller() + "()"
 	msg := getIndentedFunctionNameOfCaller()
 	l.CreateLogEntry(msg, LogLevelTrace)
 }
 
-func (l LoggerT) Debug(msg string) {
+func (l *LoggerT) Debug(msg string) {
 	l.CreateLogEntry(msg, LogLevelDebug)
 }
 
-func (l LoggerT) Debugf(format string, a ...interface{}) {
+func (l *LoggerT) Debugf(format string, a ...interface{}) {
 	l.CreateLogEntry(fmt.Sprintf(format, a...), LogLevelDebug)
 }
 
-func (l LoggerT) Info(msg string) {
+func (l *LoggerT) Info(msg string) {
 	l.CreateLogEntry(msg, LogLevelInfo)
 }
 
-func (l LoggerT) Infof(format string, a ...interface{}) {
+func (l *LoggerT) Infof(format string, a ...interface{}) {
 	l.CreateLogEntry(fmt.Sprintf(format, a...), LogLevelInfo)
 }
 
-func (l LoggerT) InfoPrint(msg string) {
+func (l *LoggerT) InfoPrint(msg string) {
 	fmt.Println(msg)
 	l.Info(msg)
 }
 
-func (l LoggerT) InfoPrintf(format string, a ...interface{}) {
+func (l *LoggerT) InfoPrintf(format string, a ...interface{}) {
 	msg := fmt.Sprintf(format, a...)
 	l.InfoPrint(msg)
 }
 
-func (l LoggerT) Error(msg string) {
+func (l *LoggerT) Error(msg string) {
 	l.CreateLogEntry(msg, LogLevelError)
 	if l.FnCallbackOnError != nil {
 		l.FnCallbackOnError()
 	}
 }
 
-func (l LoggerT) Errorf(format string, a ...interface{}) {
+func (l *LoggerT) Errorf(format string, a ...interface{}) {
 	l.Error(fmt.Sprintf(format, a...))
 }
 
-func (l LoggerT) ErrorfContext(_format string, a ...interface{}) {
+func (l *LoggerT) ErrorfContext(_format string, a ...interface{}) {
 	l.Error(callsite.SprintfContext(_format, a...))
 }
 
-func (l LoggerT) ErrorE(err error) {
+func (l *LoggerT) ErrorE(err error) {
 	l.Error(err.Error())
 }
 
-func (l LoggerT) ErrorPrint(msg string) {
+func (l *LoggerT) ErrorPrint(msg string) {
 	fmt.Println("ERROR: " + msg)
 	l.Error(msg)
 }
 
-func (l LoggerT) ErrorPrintf(format string, a ...interface{}) {
+func (l *LoggerT) ErrorPrintf(format string, a ...interface{}) {
 	msg := fmt.Sprintf(format, a...)
 	l.ErrorPrint(msg)
 }
 
-func (l LoggerT) CreateLogEntry(msg string, level LogLevel) {
+func (l *LoggerT) CreateLogEntry(msg string, level LogLevel) {
 	if level < l.Level || l.IsDisabled {
 		return
 	}
@@ -234,7 +241,13 @@ func (l LoggerT) CreateLogEntry(msg string, level LogLevel) {
 	// ----------------------------------------------------------------
 
 	timestamp := time.Now().Format("2006-01-02T15:04:05.000-0700")
-	l.RollingFile.Write([]byte(fmt.Sprintf("%s | %-5s | %s\n", timestamp, level.String(), msg)))
+	if _, err := l.RollingFile.Write([]byte(fmt.Sprintf("%s | %-5s | %s\n", timestamp, level.String(), msg))); err != nil {
+		// Make the failure visible somewhere (stderr) on the first occurrence,
+		// then stay quiet so a persistently broken sink doesn't spam.
+		if l.IsLogWriteFailedOnce.CompareAndSwap(false, true) {
+			fmt.Fprintf(os.Stderr, "quicklog: log write failed (%v); suppressing further write-failure notices for this logger\n", err)
+		}
+	}
 }
 
 func newRollingFile(config ConfigT) io.Writer {

@@ -14,8 +14,10 @@ to [Semantic Versioning](http://semver.org/spec/v2.0.0.html).
 - Guard the named-logger registry with a mutex, fixing a data race (and a racy double-configure check) when loggers are created or fetched concurrently.
 - Cap stack walking in `Trace()` so calls from goroutines not descended from `runtime.main` no longer produce runaway indentation.
 - Create the log directory with mode `0755` instead of `0744` so it is traversable.
+- Make log-write failures observable: `CreateLogEntry` now checks the write error and reports the first failure for a logger to `stderr` (subsequent failures are suppressed to avoid spam).
 
 ### Changed
+- Convert `LoggerT` methods to pointer receivers, matching how loggers are handed out (`*LoggerT`) and avoiding a per-call struct copy.
 - Document that `ConfigT.MaxAge` has no default (0 disables age-based deletion; the rolled-file count is still bounded by `MaxBackups`), in both the code and the README.
 
 ## 2.0.0  2025-05-08
