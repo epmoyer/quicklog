@@ -1,0 +1,17 @@
+# Binaries and build output
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+
+# Log output
+logs/
+*.log
+
+# Editor/OS cruft
+.DS_Store
+.vscode/
+.idea/
