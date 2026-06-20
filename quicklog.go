@@ -373,13 +373,20 @@ func getIndentedFunctionNameOfCaller() string {
 
 	skip := depthOfCaller
 	prefix := ""
+	// funcName is the name of the caller we report. The first frame we inspect
+	// (skip == depthOfCaller) is exactly that caller, so we capture it there
+	// rather than walking the stack a second time. It stays "unknown" if that
+	// frame can't be read.
+	funcName := "unknown"
 	for skip-depthOfCaller < maxTraceDepth {
 		pc, _, _, ok := runtime.Caller(skip)
 		if !ok {
 			break
 		}
 		name := runtime.FuncForPC(pc).Name()
-		// fmt.Printf("🟣      %s\n", name)
+		if skip == depthOfCaller {
+			funcName = name
+		}
 		if name == "runtime.main" {
 			// We stop traversing the stack at runtime.main because we consider that
 			// "Depth -1" for our purposes.  In practice the Go runtime has an additional
@@ -402,13 +409,6 @@ func getIndentedFunctionNameOfCaller() string {
 
 	// We clip to 0 so that the value is never negative if we somehow made a mistake.
 	depth := max(skip-depthOfCaller, 0)
-
-	// Get the function name of the caller
-	pc, _, _, ok := runtime.Caller(2)
-	if !ok {
-		return "unknown"
-	}
-	funcName := runtime.FuncForPC(pc).Name()
 
 	// Create indentation based on the depth
 	indentation := strings.Repeat("  ", depth)
