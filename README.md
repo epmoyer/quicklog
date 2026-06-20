@@ -23,6 +23,9 @@ convenience helpers that both log and print to the console.
   indented by call depth, for readable call-flow logs.
 - **Error callback** — supply `FnCallbackOnError` to increment a counter or
   fire an alert whenever an error is logged.
+- **Lifecycle control** — `Close(loggerId)` and `CloseAll()` flush and close
+  log files and drop them from the registry, for clean shutdown or before
+  reconfiguring.
 
 ## Installation
 

@@ -3,12 +3,14 @@
 package quicklog
 
 import (
+	"errors"
 	"fmt"
 	"github.com/epmoyer/callsite"
 	"io"
 	"os"
 	"path"
 	"runtime"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -21,7 +23,7 @@ type LogLevel int8
 
 const defaultMaxBackups = 5
 const defaultMaxSize = 50 // 50 MB
-const packageVersion = "v2.1.0"
+const modulePath = "github.com/epmoyer/quicklog/v2"
 
 const (
 	LogLevelTrace LogLevel = iota
@@ -87,6 +89,9 @@ func (c *ConfigT) SetDefaults() {
 }
 
 type LoggerT struct {
+	// LoggerId is the registry id this logger was created under. Used in
+	// diagnostic messages.
+	LoggerId          string
 	RollingFile       io.Writer
 	Level             LogLevel
 	FnCallbackOnError func()
@@ -102,6 +107,10 @@ type LoggerT struct {
 	// under concurrent writes; methods use pointer receivers so it is never
 	// copied.
 	IsLogWriteFailedOnce atomic.Bool
+	// IsStubWarnedOnce records whether we have already warned that this logger is
+	// an unconfigured stub still writing to stderr. Warned once, then silent, in
+	// the same spirit as IsLogWriteFailedOnce.
+	IsStubWarnedOnce atomic.Bool
 }
 
 func GetLogger(loggerId string) *LoggerT {
@@ -123,6 +132,7 @@ func getLoggerLocked(loggerId string) *LoggerT {
 
 	// Create a stub logger that logs to stderr
 	stubLogger := &LoggerT{
+		LoggerId:          loggerId,
 		RollingFile:       os.Stderr,
 		Level:             LogLevelInfo,
 		FnCallbackOnError: nil,
@@ -163,8 +173,55 @@ func ConfigureLogger(config ConfigT) *LoggerT {
 	loggersMu.Unlock()
 
 	logger.Info("---------------------------- BEGIN ----------------------------")
-	logger.Infof("quicklog %s", packageVersion)
+	logger.Infof("quicklog %s", packageVersion())
 	return logger
+}
+
+// Close flushes and closes the logger registered under loggerId and removes it
+// from the registry. After Close, a subsequent GetLogger(loggerId) returns a
+// fresh stub and ConfigureLogger may register a new logger under that id. It is
+// a no-op (returning nil) if no logger is registered under loggerId. The shared
+// stderr/stdout streams used by stub loggers are never closed.
+func Close(loggerId string) error {
+	loggersMu.Lock()
+	defer loggersMu.Unlock()
+
+	logger, exists := loggers[loggerId]
+	if !exists {
+		return nil
+	}
+	delete(loggers, loggerId)
+	return closeWriter(logger.RollingFile)
+}
+
+// CloseAll closes every registered logger and empties the registry, returning
+// the joined error of all underlying Close calls. It is typically called once
+// on program shutdown.
+func CloseAll() error {
+	loggersMu.Lock()
+	defer loggersMu.Unlock()
+
+	var errs []error
+	for id, logger := range loggers {
+		if err := closeWriter(logger.RollingFile); err != nil {
+			errs = append(errs, fmt.Errorf("%s: %w", id, err))
+		}
+		delete(loggers, id)
+	}
+	return errors.Join(errs...)
+}
+
+// closeWriter closes w if it owns a closeable resource (e.g. a lumberjack file).
+// It never closes the shared std streams, which stub loggers and the
+// mkdir-failure fallback write to.
+func closeWriter(w io.Writer) error {
+	if w == os.Stderr || w == os.Stdout {
+		return nil
+	}
+	if c, ok := w.(io.Closer); ok {
+		return c.Close()
+	}
+	return nil
 }
 
 func (l *LoggerT) Trace() {
@@ -200,6 +257,11 @@ func (l *LoggerT) InfoPrintf(format string, a ...interface{}) {
 }
 
 func (l *LoggerT) Error(msg string) {
+	// A disabled logger logs nothing and fires no callback. (The *Print helpers
+	// still print, because they print before calling Error.)
+	if l.IsDisabled {
+		return
+	}
 	l.CreateLogEntry(msg, LogLevelError)
 	if l.FnCallbackOnError != nil {
 		l.FnCallbackOnError()
@@ -233,6 +295,13 @@ func (l *LoggerT) CreateLogEntry(msg string, level LogLevel) {
 		return
 	}
 
+	// Logging through an unconfigured stub logger is easy to do by accident
+	// (e.g. a mismatched LoggerId) and otherwise silently writes to stderr
+	// forever. Surface it once, then stay quiet.
+	if l.IsStub && l.IsStubWarnedOnce.CompareAndSwap(false, true) {
+		fmt.Fprintf(os.Stderr, "quicklog: logging through unconfigured stub logger %q (writing to stderr); call ConfigureLogger with this LoggerId to set it up\n", l.LoggerId)
+	}
+
 	// TODO: Use the pattern below to implement an option allowing
 	//       a timezone location to be specified (e.g., to log as UTC)
 	// ----------------------------------------------------------------
@@ -262,6 +331,32 @@ func newRollingFile(config ConfigT) io.Writer {
 		MaxSize:    config.MaxSize,    // megabytes
 		MaxAge:     config.MaxAge,     // days
 	}
+}
+
+// packageVersion reports quicklog's module version as recorded in the build
+// info of the program importing it. It returns "(devel)" when no version is
+// stamped (e.g. when building within the quicklog module itself, or with build
+// info unavailable).
+func packageVersion() string {
+	bi, ok := debug.ReadBuildInfo()
+	if !ok {
+		return "(devel)"
+	}
+	// When quicklog is imported as a dependency, its version is recorded in Deps.
+	for _, dep := range bi.Deps {
+		if dep.Path == modulePath {
+			if dep.Replace != nil {
+				return dep.Replace.Version
+			}
+			return dep.Version
+		}
+	}
+	// When building within the quicklog module itself, it is the main module and
+	// typically carries no released version.
+	if bi.Main.Path == modulePath && bi.Main.Version != "" {
+		return bi.Main.Version
+	}
+	return "(devel)"
 }
 
 func getIndentedFunctionNameOfCaller() string {
