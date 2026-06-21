@@ -3,13 +3,17 @@
 package quicklog
 
 import (
-	"github.com/epmoyer/callsite"
+	"errors"
 	"fmt"
+	"github.com/epmoyer/callsite"
 	"io"
 	"os"
 	"path"
 	"runtime"
+	"runtime/debug"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"gopkg.in/natefinch/lumberjack.v2"
@@ -19,7 +23,7 @@ type LogLevel int8
 
 const defaultMaxBackups = 5
 const defaultMaxSize = 50 // 50 MB
-const packageVersion = "v2.0.0"
+const modulePath = "github.com/epmoyer/quicklog/v2"
 
 const (
 	LogLevelTrace LogLevel = iota
@@ -28,7 +32,10 @@ const (
 	LogLevelError
 )
 
-var loggers = make(map[string]*LoggerT)
+var (
+	loggers   = make(map[string]*LoggerT)
+	loggersMu sync.Mutex
+)
 
 func (level LogLevel) String() string {
 	switch level {
@@ -56,7 +63,9 @@ type ConfigT struct {
 	MaxSize int
 	// MaxBackups the max number of rolled files to keep
 	MaxBackups int
-	// MaxAge the max age in days to keep a log file
+	// MaxAge the max age in days to keep a rolled log file. Unlike MaxSize and
+	// MaxBackups, this has no default: if left 0, lumberjack performs no
+	// age-based deletion (the file count is still bounded by MaxBackups).
 	MaxAge int
 	// Min LogLevel to log
 	Level LogLevel
@@ -74,18 +83,37 @@ func (c *ConfigT) SetDefaults() {
 	if c.MaxSize == 0 {
 		c.MaxSize = defaultMaxSize
 	}
+	// NOTE: MaxAge is intentionally not defaulted. Leaving it 0 disables
+	// age-based deletion in lumberjack; the number of rolled files is still
+	// bounded by MaxBackups.
 }
 
+// LoggerT is an opaque logger handle. Obtain one from GetLogger or
+// ConfigureLogger and interact with it through its methods; its fields are
+// unexported and configured via ConfigT.
 type LoggerT struct {
-	RollingFile       io.Writer
-	Level             LogLevel
-	FnCallbackOnError func()
-	IsDisabled        bool
-	// This is set for a "stub" logger, which gets created if someone requests a named logger
+	// loggerId is the registry id this logger was created under. Used in
+	// diagnostic messages.
+	loggerId          string
+	rollingFile       io.Writer
+	level             LogLevel
+	fnCallbackOnError func()
+	isDisabled        bool
+	// isStub is set for a "stub" logger, which gets created if someone requests a named logger
 	// which does not (yet) exist.  The stub logger will "log" to stderr, and will be
 	// upgraded to a real logger when ConfigureLogger is called with the same LoggerId to
 	// create a real logger.
-	IsStub bool
+	isStub bool
+	// isLogWriteFailedOnce records whether a write to rollingFile has already
+	// failed. We surface the first failure on stderr but stay quiet on every
+	// subsequent one so a broken sink doesn't spam. atomic.Bool keeps it safe
+	// under concurrent writes; methods use pointer receivers so it is never
+	// copied.
+	isLogWriteFailedOnce atomic.Bool
+	// isStubWarnedOnce records whether we have already warned that this logger is
+	// an unconfigured stub still writing to stderr. Warned once, then silent, in
+	// the same spirit as isLogWriteFailedOnce.
+	isStubWarnedOnce atomic.Bool
 }
 
 func GetLogger(loggerId string) *LoggerT {
@@ -93,17 +121,26 @@ func GetLogger(loggerId string) *LoggerT {
 		panic("LoggerId must be set")
 	}
 
+	loggersMu.Lock()
+	defer loggersMu.Unlock()
+	return getLoggerLocked(loggerId)
+}
+
+// getLoggerLocked returns the logger registered for loggerId, lazily creating a
+// stderr stub if none exists yet. Callers MUST hold loggersMu.
+func getLoggerLocked(loggerId string) *LoggerT {
 	if logger, exists := loggers[loggerId]; exists {
 		return logger
 	}
 
 	// Create a stub logger that logs to stderr
 	stubLogger := &LoggerT{
-		RollingFile:       os.Stderr,
-		Level:             LogLevelInfo,
-		FnCallbackOnError: nil,
-		IsDisabled:        false,
-		IsStub:            true,
+		loggerId:          loggerId,
+		rollingFile:       os.Stderr,
+		level:             LogLevelInfo,
+		fnCallbackOnError: nil,
+		isDisabled:        false,
+		isStub:            true,
 	}
 	loggers[loggerId] = stubLogger
 	return stubLogger
@@ -116,90 +153,156 @@ func ConfigureLogger(config ConfigT) *LoggerT {
 	config.SetDefaults()
 	rollingFile := newRollingFile(config)
 
-	// This will return the stub logger if it exists, or create a new stub logger.
-	// If it return a REAL logger, then that means a logger has ALREADY been configured
-	// with the same LoggerId, which is not allowed, so we panic.
-	logger := GetLogger(config.LoggerId)
-	if !logger.IsStub {
+	// Fetch-and-upgrade must happen atomically under the lock; otherwise two
+	// goroutines configuring the same LoggerId could both observe the stub and
+	// both "upgrade" it, racing on the fields and defeating the double-configure
+	// guard below.
+	loggersMu.Lock()
+	// getLoggerLocked returns the stub logger if it exists, or creates a new stub
+	// logger. If it returns a REAL logger, then a logger has ALREADY been
+	// configured with the same LoggerId, which is not allowed, so we panic.
+	logger := getLoggerLocked(config.LoggerId)
+	if !logger.isStub {
+		loggersMu.Unlock()
 		panic(fmt.Sprintf("Logger with LoggerId '%s' has already been configured", config.LoggerId))
 	}
 
 	// Upgrade the stub logger to a real logger
-	logger.RollingFile = rollingFile
-	logger.Level = config.Level
-	logger.FnCallbackOnError = config.FnCallbackOnError
-	logger.IsDisabled = config.IsDisabled
-	logger.IsStub = false
+	logger.rollingFile = rollingFile
+	logger.level = config.Level
+	logger.fnCallbackOnError = config.FnCallbackOnError
+	logger.isDisabled = config.IsDisabled
+	logger.isStub = false
+	loggersMu.Unlock()
 
 	logger.Info("---------------------------- BEGIN ----------------------------")
-	logger.Infof("quicklog %s", packageVersion)
+	logger.Infof("quicklog %s", packageVersion())
 	return logger
 }
 
-func (l LoggerT) Trace() {
+// Close flushes and closes the logger registered under loggerId and removes it
+// from the registry. After Close, a subsequent GetLogger(loggerId) returns a
+// fresh stub and ConfigureLogger may register a new logger under that id. It is
+// a no-op (returning nil) if no logger is registered under loggerId. The shared
+// stderr/stdout streams used by stub loggers are never closed.
+func Close(loggerId string) error {
+	loggersMu.Lock()
+	defer loggersMu.Unlock()
+
+	logger, exists := loggers[loggerId]
+	if !exists {
+		return nil
+	}
+	delete(loggers, loggerId)
+	return closeWriter(logger.rollingFile)
+}
+
+// CloseAll closes every registered logger and empties the registry, returning
+// the joined error of all underlying Close calls. It is typically called once
+// on program shutdown.
+func CloseAll() error {
+	loggersMu.Lock()
+	defer loggersMu.Unlock()
+
+	var errs []error
+	for id, logger := range loggers {
+		if err := closeWriter(logger.rollingFile); err != nil {
+			errs = append(errs, fmt.Errorf("%s: %w", id, err))
+		}
+		delete(loggers, id)
+	}
+	return errors.Join(errs...)
+}
+
+// closeWriter closes w if it owns a closeable resource (e.g. a lumberjack file).
+// It never closes the shared std streams, which stub loggers and the
+// mkdir-failure fallback write to.
+func closeWriter(w io.Writer) error {
+	if w == os.Stderr || w == os.Stdout {
+		return nil
+	}
+	if c, ok := w.(io.Closer); ok {
+		return c.Close()
+	}
+	return nil
+}
+
+func (l *LoggerT) Trace() {
 	// msg := getFunctionNameOfCaller() + "()"
 	msg := getIndentedFunctionNameOfCaller()
 	l.CreateLogEntry(msg, LogLevelTrace)
 }
 
-func (l LoggerT) Debug(msg string) {
+func (l *LoggerT) Debug(msg string) {
 	l.CreateLogEntry(msg, LogLevelDebug)
 }
 
-func (l LoggerT) Debugf(format string, a ...interface{}) {
+func (l *LoggerT) Debugf(format string, a ...interface{}) {
 	l.CreateLogEntry(fmt.Sprintf(format, a...), LogLevelDebug)
 }
 
-func (l LoggerT) Info(msg string) {
+func (l *LoggerT) Info(msg string) {
 	l.CreateLogEntry(msg, LogLevelInfo)
 }
 
-func (l LoggerT) Infof(format string, a ...interface{}) {
+func (l *LoggerT) Infof(format string, a ...interface{}) {
 	l.CreateLogEntry(fmt.Sprintf(format, a...), LogLevelInfo)
 }
 
-func (l LoggerT) InfoPrint(msg string) {
+func (l *LoggerT) InfoPrint(msg string) {
 	fmt.Println(msg)
 	l.Info(msg)
 }
 
-func (l LoggerT) InfoPrintf(format string, a ...interface{}) {
+func (l *LoggerT) InfoPrintf(format string, a ...interface{}) {
 	msg := fmt.Sprintf(format, a...)
 	l.InfoPrint(msg)
 }
 
-func (l LoggerT) Error(msg string) {
+func (l *LoggerT) Error(msg string) {
+	// A disabled logger logs nothing and fires no callback. (The *Print helpers
+	// still print, because they print before calling Error.)
+	if l.isDisabled {
+		return
+	}
 	l.CreateLogEntry(msg, LogLevelError)
-	if l.FnCallbackOnError != nil {
-		l.FnCallbackOnError()
+	if l.fnCallbackOnError != nil {
+		l.fnCallbackOnError()
 	}
 }
 
-func (l LoggerT) Errorf(format string, a ...interface{}) {
+func (l *LoggerT) Errorf(format string, a ...interface{}) {
 	l.Error(fmt.Sprintf(format, a...))
 }
 
-func (l LoggerT) ErrorfContext(_format string, a ...interface{}) {
+func (l *LoggerT) ErrorfContext(_format string, a ...interface{}) {
 	l.Error(callsite.SprintfContext(_format, a...))
 }
 
-func (l LoggerT) ErrorE(err error) {
+func (l *LoggerT) ErrorE(err error) {
 	l.Error(err.Error())
 }
 
-func (l LoggerT) ErrorPrint(msg string) {
+func (l *LoggerT) ErrorPrint(msg string) {
 	fmt.Println("ERROR: " + msg)
 	l.Error(msg)
 }
 
-func (l LoggerT) ErrorPrintf(format string, a ...interface{}) {
+func (l *LoggerT) ErrorPrintf(format string, a ...interface{}) {
 	msg := fmt.Sprintf(format, a...)
 	l.ErrorPrint(msg)
 }
 
-func (l LoggerT) CreateLogEntry(msg string, level LogLevel) {
-	if level < l.Level || l.IsDisabled {
+func (l *LoggerT) CreateLogEntry(msg string, level LogLevel) {
+	if level < l.level || l.isDisabled {
 		return
+	}
+
+	// Logging through an unconfigured stub logger is easy to do by accident
+	// (e.g. a mismatched LoggerId) and otherwise silently writes to stderr
+	// forever. Surface it once, then stay quiet.
+	if l.isStub && l.isStubWarnedOnce.CompareAndSwap(false, true) {
+		fmt.Fprintf(os.Stderr, "quicklog: logging through unconfigured stub logger %q (writing to stderr); call ConfigureLogger with this LoggerId to set it up\n", l.loggerId)
 	}
 
 	// TODO: Use the pattern below to implement an option allowing
@@ -210,13 +313,19 @@ func (l LoggerT) CreateLogEntry(msg string, level LogLevel) {
 	// ----------------------------------------------------------------
 
 	timestamp := time.Now().Format("2006-01-02T15:04:05.000-0700")
-	l.RollingFile.Write([]byte(fmt.Sprintf("%s | %-5s | %s\n", timestamp, level.String(), msg)))
+	if _, err := l.rollingFile.Write([]byte(fmt.Sprintf("%s | %-5s | %s\n", timestamp, level.String(), msg))); err != nil {
+		// Make the failure visible somewhere (stderr) on the first occurrence,
+		// then stay quiet so a persistently broken sink doesn't spam.
+		if l.isLogWriteFailedOnce.CompareAndSwap(false, true) {
+			fmt.Fprintf(os.Stderr, "quicklog: log write failed (%v); suppressing further write-failure notices for this logger\n", err)
+		}
+	}
 }
 
 func newRollingFile(config ConfigT) io.Writer {
-	if err := os.MkdirAll(config.Directory, 0744); err != nil {
-		fmt.Printf("Can't create log directory at: %s\n", config.Directory)
-		return nil
+	if err := os.MkdirAll(config.Directory, 0755); err != nil {
+		fmt.Printf("quicklog: can't create log directory at %q (%v); falling back to stderr\n", config.Directory, err)
+		return os.Stderr
 	}
 
 	return &lumberjack.Logger{
@@ -227,31 +336,60 @@ func newRollingFile(config ConfigT) io.Writer {
 	}
 }
 
-// getFunctionNameOfCaller gets the name of the function which CALLED the function
-// which called getFunctionNameOfCaller.
-// func getFunctionNameOfCaller() string {
-// 	pc, _, _, ok := runtime.Caller(2) // 1 to get the calling function
-// 	if !ok {
-// 		return "unknown"
-// 	}
-// 	return runtime.FuncForPC(pc).Name()
-// }
+// packageVersion reports quicklog's module version as recorded in the build
+// info of the program importing it. It returns "(devel)" when no version is
+// stamped (e.g. when building within the quicklog module itself, or with build
+// info unavailable).
+func packageVersion() string {
+	bi, ok := debug.ReadBuildInfo()
+	if !ok {
+		return "(devel)"
+	}
+	// When quicklog is imported as a dependency, its version is recorded in Deps.
+	for _, dep := range bi.Deps {
+		if dep.Path == modulePath {
+			if dep.Replace != nil {
+				return dep.Replace.Version
+			}
+			return dep.Version
+		}
+	}
+	// When building within the quicklog module itself, it is the main module and
+	// typically carries no released version.
+	if bi.Main.Path == modulePath && bi.Main.Version != "" {
+		return bi.Main.Version
+	}
+	return "(devel)"
+}
 
 func getIndentedFunctionNameOfCaller() string {
 
 	// Start with skip = 2 to get the CALLER of the function that CALLS this function.
 	const depthOfCaller = 2
 
+	// maxTraceDepth caps how far up the stack we walk (and therefore how deep we
+	// indent). Goroutines that were not spawned from runtime.main never have
+	// runtime.main (or gin's Context.Next) on their stack, so without this cap the
+	// loop would walk all the way to the top of the goroutine's stack and produce
+	// nonsensically deep indentation.
+	const maxTraceDepth = 30
+
 	skip := depthOfCaller
-	// fmt.Printf("🟣  trace\n")
 	prefix := ""
-	for {
+	// funcName is the name of the caller we report. The first frame we inspect
+	// (skip == depthOfCaller) is exactly that caller, so we capture it there
+	// rather than walking the stack a second time. It stays "unknown" if that
+	// frame can't be read.
+	funcName := "unknown"
+	for skip-depthOfCaller < maxTraceDepth {
 		pc, _, _, ok := runtime.Caller(skip)
 		if !ok {
 			break
 		}
 		name := runtime.FuncForPC(pc).Name()
-		// fmt.Printf("🟣      %s\n", name)
+		if skip == depthOfCaller {
+			funcName = name
+		}
 		if name == "runtime.main" {
 			// We stop traversing the stack at runtime.main because we consider that
 			// "Depth -1" for our purposes.  In practice the Go runtime has an additional
@@ -274,13 +412,6 @@ func getIndentedFunctionNameOfCaller() string {
 
 	// We clip to 0 so that the value is never negative if we somehow made a mistake.
 	depth := max(skip-depthOfCaller, 0)
-
-	// Get the function name of the caller
-	pc, _, _, ok := runtime.Caller(2)
-	if !ok {
-		return "unknown"
-	}
-	funcName := runtime.FuncForPC(pc).Name()
 
 	// Create indentation based on the depth
 	indentation := strings.Repeat("  ", depth)
