@@ -11,6 +11,7 @@ to [Semantic Versioning](http://semver.org/spec/v2.0.0.html).
 ## v2.1.0 2026-06-20
 ### Added
 - `Close(loggerId)` and `CloseAll()` to flush/close logger files and remove them from the registry (e.g. on shutdown or before reconfiguring). The shared stderr/stdout streams used by stub loggers are never closed.
+- Unit test suite (`quicklog_test.go`) covering level filtering, the stub-upgrade flow, disable semantics, the once-only write-failure and stub warnings, `Close`/`CloseAll`, and concurrent registry access.
 
 ### Fixed
 - Avoid a panic on the first write when the log directory cannot be created. `newRollingFile` now falls back to `stderr` instead of returning a nil writer.
