@@ -6,6 +6,8 @@ A small, dependency-light logging package for Go.
 registry so packages can share loggers without passing references around, and
 convenience helpers that both log and print to the console.
 
+**This project is "internal" and is not accepting PRs/issues at this time.**
+
 ## Features
 
 - **Leveled logging** — `Trace`, `Debug`, `Info`, `Error`, with a configurable
