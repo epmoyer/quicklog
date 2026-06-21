@@ -88,29 +88,32 @@ func (c *ConfigT) SetDefaults() {
 	// bounded by MaxBackups.
 }
 
+// LoggerT is an opaque logger handle. Obtain one from GetLogger or
+// ConfigureLogger and interact with it through its methods; its fields are
+// unexported and configured via ConfigT.
 type LoggerT struct {
-	// LoggerId is the registry id this logger was created under. Used in
+	// loggerId is the registry id this logger was created under. Used in
 	// diagnostic messages.
-	LoggerId          string
-	RollingFile       io.Writer
-	Level             LogLevel
-	FnCallbackOnError func()
-	IsDisabled        bool
-	// This is set for a "stub" logger, which gets created if someone requests a named logger
+	loggerId          string
+	rollingFile       io.Writer
+	level             LogLevel
+	fnCallbackOnError func()
+	isDisabled        bool
+	// isStub is set for a "stub" logger, which gets created if someone requests a named logger
 	// which does not (yet) exist.  The stub logger will "log" to stderr, and will be
 	// upgraded to a real logger when ConfigureLogger is called with the same LoggerId to
 	// create a real logger.
-	IsStub bool
-	// IsLogWriteFailedOnce records whether a write to RollingFile has already
+	isStub bool
+	// isLogWriteFailedOnce records whether a write to rollingFile has already
 	// failed. We surface the first failure on stderr but stay quiet on every
 	// subsequent one so a broken sink doesn't spam. atomic.Bool keeps it safe
 	// under concurrent writes; methods use pointer receivers so it is never
 	// copied.
-	IsLogWriteFailedOnce atomic.Bool
-	// IsStubWarnedOnce records whether we have already warned that this logger is
+	isLogWriteFailedOnce atomic.Bool
+	// isStubWarnedOnce records whether we have already warned that this logger is
 	// an unconfigured stub still writing to stderr. Warned once, then silent, in
-	// the same spirit as IsLogWriteFailedOnce.
-	IsStubWarnedOnce atomic.Bool
+	// the same spirit as isLogWriteFailedOnce.
+	isStubWarnedOnce atomic.Bool
 }
 
 func GetLogger(loggerId string) *LoggerT {
@@ -132,12 +135,12 @@ func getLoggerLocked(loggerId string) *LoggerT {
 
 	// Create a stub logger that logs to stderr
 	stubLogger := &LoggerT{
-		LoggerId:          loggerId,
-		RollingFile:       os.Stderr,
-		Level:             LogLevelInfo,
-		FnCallbackOnError: nil,
-		IsDisabled:        false,
-		IsStub:            true,
+		loggerId:          loggerId,
+		rollingFile:       os.Stderr,
+		level:             LogLevelInfo,
+		fnCallbackOnError: nil,
+		isDisabled:        false,
+		isStub:            true,
 	}
 	loggers[loggerId] = stubLogger
 	return stubLogger
@@ -159,17 +162,17 @@ func ConfigureLogger(config ConfigT) *LoggerT {
 	// logger. If it returns a REAL logger, then a logger has ALREADY been
 	// configured with the same LoggerId, which is not allowed, so we panic.
 	logger := getLoggerLocked(config.LoggerId)
-	if !logger.IsStub {
+	if !logger.isStub {
 		loggersMu.Unlock()
 		panic(fmt.Sprintf("Logger with LoggerId '%s' has already been configured", config.LoggerId))
 	}
 
 	// Upgrade the stub logger to a real logger
-	logger.RollingFile = rollingFile
-	logger.Level = config.Level
-	logger.FnCallbackOnError = config.FnCallbackOnError
-	logger.IsDisabled = config.IsDisabled
-	logger.IsStub = false
+	logger.rollingFile = rollingFile
+	logger.level = config.Level
+	logger.fnCallbackOnError = config.FnCallbackOnError
+	logger.isDisabled = config.IsDisabled
+	logger.isStub = false
 	loggersMu.Unlock()
 
 	logger.Info("---------------------------- BEGIN ----------------------------")
@@ -191,7 +194,7 @@ func Close(loggerId string) error {
 		return nil
 	}
 	delete(loggers, loggerId)
-	return closeWriter(logger.RollingFile)
+	return closeWriter(logger.rollingFile)
 }
 
 // CloseAll closes every registered logger and empties the registry, returning
@@ -203,7 +206,7 @@ func CloseAll() error {
 
 	var errs []error
 	for id, logger := range loggers {
-		if err := closeWriter(logger.RollingFile); err != nil {
+		if err := closeWriter(logger.rollingFile); err != nil {
 			errs = append(errs, fmt.Errorf("%s: %w", id, err))
 		}
 		delete(loggers, id)
@@ -259,12 +262,12 @@ func (l *LoggerT) InfoPrintf(format string, a ...interface{}) {
 func (l *LoggerT) Error(msg string) {
 	// A disabled logger logs nothing and fires no callback. (The *Print helpers
 	// still print, because they print before calling Error.)
-	if l.IsDisabled {
+	if l.isDisabled {
 		return
 	}
 	l.CreateLogEntry(msg, LogLevelError)
-	if l.FnCallbackOnError != nil {
-		l.FnCallbackOnError()
+	if l.fnCallbackOnError != nil {
+		l.fnCallbackOnError()
 	}
 }
 
@@ -291,15 +294,15 @@ func (l *LoggerT) ErrorPrintf(format string, a ...interface{}) {
 }
 
 func (l *LoggerT) CreateLogEntry(msg string, level LogLevel) {
-	if level < l.Level || l.IsDisabled {
+	if level < l.level || l.isDisabled {
 		return
 	}
 
 	// Logging through an unconfigured stub logger is easy to do by accident
 	// (e.g. a mismatched LoggerId) and otherwise silently writes to stderr
 	// forever. Surface it once, then stay quiet.
-	if l.IsStub && l.IsStubWarnedOnce.CompareAndSwap(false, true) {
-		fmt.Fprintf(os.Stderr, "quicklog: logging through unconfigured stub logger %q (writing to stderr); call ConfigureLogger with this LoggerId to set it up\n", l.LoggerId)
+	if l.isStub && l.isStubWarnedOnce.CompareAndSwap(false, true) {
+		fmt.Fprintf(os.Stderr, "quicklog: logging through unconfigured stub logger %q (writing to stderr); call ConfigureLogger with this LoggerId to set it up\n", l.loggerId)
 	}
 
 	// TODO: Use the pattern below to implement an option allowing
@@ -310,10 +313,10 @@ func (l *LoggerT) CreateLogEntry(msg string, level LogLevel) {
 	// ----------------------------------------------------------------
 
 	timestamp := time.Now().Format("2006-01-02T15:04:05.000-0700")
-	if _, err := l.RollingFile.Write([]byte(fmt.Sprintf("%s | %-5s | %s\n", timestamp, level.String(), msg))); err != nil {
+	if _, err := l.rollingFile.Write([]byte(fmt.Sprintf("%s | %-5s | %s\n", timestamp, level.String(), msg))); err != nil {
 		// Make the failure visible somewhere (stderr) on the first occurrence,
 		// then stay quiet so a persistently broken sink doesn't spam.
-		if l.IsLogWriteFailedOnce.CompareAndSwap(false, true) {
+		if l.isLogWriteFailedOnce.CompareAndSwap(false, true) {
 			fmt.Fprintf(os.Stderr, "quicklog: log write failed (%v); suppressing further write-failure notices for this logger\n", err)
 		}
 	}

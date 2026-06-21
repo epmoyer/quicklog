@@ -21,6 +21,7 @@ to [Semantic Versioning](http://semver.org/spec/v2.0.0.html).
 - Make accidental use of an unconfigured stub logger observable: the first time a stub logger emits, it warns once on `stderr` (naming the `LoggerId`), then stays silent.
 
 ### Changed
+- Make `LoggerT` an opaque handle: its fields are now unexported and configured only via `ConfigT`. Callers interact through methods. (Breaking for any code that read/wrote `LoggerT` fields directly.)
 - Derive the reported package version from build info (`debug.ReadBuildInfo`) instead of a hardcoded constant.
 - A disabled logger (`IsDisabled`) no longer fires `FnCallbackOnError`; the callback now only runs when an error is actually logged. (The `*Print` helpers still print to the console.)
 - Convert `LoggerT` methods to pointer receivers, matching how loggers are handed out (`*LoggerT`) and avoiding a per-call struct copy.
